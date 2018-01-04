@@ -1,5 +1,6 @@
 /*
    See http://www.maxpierson.me/2009/03/20/receive-dmx-512-with-an-arduino/
+   See https://github.com/mathertel/DMXSerial/blob/master/src/DMXSerial.cpp
 */
 
 #include <LiquidCrystal.h>
@@ -21,26 +22,39 @@
 
 // DMX
 #define DMX_BAUDRATE 250000
+#define DMX_SERIAL_MAX 512
+
+// State of receiving DMX Bytes
+typedef enum {
+  STARTUP = 1,  // wait for any interrupt BEFORE starting anylyzig the DMX protocoll.
+  IDLE    = 2,  // wait for a BREAK condition.
+  BREAK   = 3,  // BREAK was detected.
+  DATA    = 4,  // DMX data.
+  DONE    = 5   // All channels received.
+} __attribute__((packed)) DMXReceivingState;
+
 
 LiquidCrystal lcd(LCD_RS, LCD_EN, LCD_D4, LCD_D5, LCD_D6, LCD_D7);
 
 #define NUMBER_OF_CHANNELS 100
 
-volatile byte i = 0;              //dummy variable for dmxvalue[]
-volatile byte dmxreceived = 0;    //the latest received value
-volatile unsigned int dmxcurrent = 0;     //counter variable that is incremented every time we receive a value.
-volatile byte dmxvalue[NUMBER_OF_CHANNELS];
-/*  stores the DMX values we're interested in using--
-    keep in mind that this is 0-indexed. */
-volatile boolean dmxnewvalue = false;
-/*  set to 1 when updated dmx values are received
-    (even if they are the same values as the last time). */
-unsigned int dmxaddress = 1;
+uint8_t _dmxRecvState;  // Current State of receiving DMX Bytes
+int     _dmxChannel;  // the next channel byte to be sent.
 
-unsigned short num_received = 0;
-unsigned short frame_errors = 0;
-unsigned short frame_complete = 0;
-unsigned short data_overrun = 0;
+volatile unsigned int  _dmxMaxChannel = 32; // the last channel used for sending (1..32).
+volatile unsigned long _dmxLastPacket = 0; // the last time (using the millis function) a packet was received.
+
+bool _dmxUpdated = true; // is set to true when new data arrived.
+
+// Array of DMX values (raw).
+// Entry 0 will never be used for DMX data but will store the startbyte (0 for DMX mode).
+uint8_t  _dmxData[DMX_SERIAL_MAX + 1];
+
+// This pointer will point to the next byte in _dmxData;
+uint8_t *_dmxDataPtr;
+
+// This pointer will point to the last byte in _dmxData;
+uint8_t *_dmxDataLastPtr;
 
 /******************************* Timer2 variable declarations *****************************/
 
@@ -59,89 +73,94 @@ void setup() {
 
   lcd.print("DMX Tester");
 
-  cli(); //disable interrupts while we're setting bits in registers
+  // Disable interrupts
+  cli();
 
   configure_serial();
-  configure_timer_2();
 
+  // Enable interrupts
   sei();
 
 }
 
 void loop()  {
   // the processor gets parked here while the ISRs are doing their thing.
-  if (dmxnewvalue == 1) {    //when a new set of values are received, jump to action loop...
+
+  if (_dmxUpdated) {    //when a new set of values are received, jump to action loop...
     action();
-    dmxnewvalue = 0;
-    dmxcurrent = 0;
-    zerocounter = 0;      //and then when finished reset variables and enable timer2 interrupt
-    i = 0;
-    bitSet(TIMSK2, OCIE2A);    //Enable Timer/Counter2 Output Compare Match A Interrupt
   }
 } //end loop()
 
 void action() {
-  //analogWrite(PWM_LED_PIN, dmxvalue[0]);
+  analogWrite(PWM_LED_PIN, _dmxData[1]);
 
   lcd.setCursor(0, 1);
-  for (int k = 0; k < 3; k++) {
-    if (dmxvalue[k] < 100) {
+  for (int k = 1; k < 5; k++) {
+    if (_dmxData[k] < 100) {
       lcd.print("0");
     }
-    if (dmxvalue[k] < 10) {
+    if (_dmxData[k] < 10) {
       lcd.print("0");
     }
-    lcd.print(dmxvalue[k]);
+    lcd.print(_dmxData[k]);
     lcd.print(" ");
   }
-
-  lcd.setCursor(4, 0);
-  lcd.print(frame_errors);
-  lcd.print(" ");
-  lcd.print(frame_complete);
-  lcd.print(" ");
-  lcd.print(data_overrun);
-  lcd.print(" ");
-  
-}
-
-ISR(TIMER2_COMPA_vect) {
-  digitalWrite(PWM_LED_PIN, HIGH);
-  if (bitRead(PIND, PIND0)) {  // if a one is detected, we're not in a break, reset zerocounter.
-    zerocounter = 0;
-  }
-  else {
-    zerocounter++;             // increment zerocounter if a zero is received.
-    if (zerocounter == 20)     // if 20 0's are received in a row (80uS break)
-    {
-      bitClear(TIMSK2, OCIE2A);    //disable this interrupt and enable reception interrupt now that we're in a break.
-      bitSet(UCSR0B, RXCIE0);
-    }
-  }
-  digitalWrite(PWM_LED_PIN, LOW);
 }
 
 ISR(USART_RX_vect) {
   /* The receive buffer (UDR0) must be read during the reception ISR, or the ISR will just
-   * execute again immediately upon exiting. 
-   */
-   
+     execute again immediately upon exiting.
+  */
+
   digitalWrite(RX_STATUS_LED_PIN, HIGH);
-  frame_errors += bitRead(UCSR0A, FE0);
-  frame_complete += bitRead(UCSR0A, RXC0);
-  data_overrun += bitRead(UCSR0A, DOR0);
-  
-  dmxreceived = UDR0;
-  
-  dmxcurrent++;                        //increment address counter
-  
-  if (dmxcurrent > dmxaddress) {        //check if the current address is the one we want.
-    dmxvalue[i] = dmxreceived;
-    i++;
-    if (i == NUMBER_OF_CHANNELS) {
-      bitClear(UCSR0B, RXCIE0);
-      dmxnewvalue = 1;                        //set newvalue, so that the main code can be executed.
-    }
+
+  uint8_t  USARTstate = UCSR0A;    // get state before data!
+  uint8_t  DmxByte    = UDR0;     // get data
+  uint8_t  DmxState   = _dmxRecvState;  //just load once from SRAM to increase speed
+
+  if (DmxState == STARTUP) {
+    // just ignore any first frame comming in
+    _dmxRecvState = IDLE;
+    return;
+  }
+
+  if (USARTstate & (1 << FE0)) {  //check for break
+    // break condition detected.
+    _dmxRecvState = BREAK;
+    _dmxDataPtr = _dmxData;
+    _dmxDataLastPtr = _dmxData + 4;
+
+  } else if (DmxState == BREAK) {
+    // first byte after a break was read.
+    if (DmxByte == 0) {
+      // normal DMX start code (0) detected
+      _dmxRecvState = DATA;
+      _dmxLastPacket = millis(); // remember current (relative) time in msecs.
+      _dmxDataPtr++; // start saving data with channel # 1
+
+    } else {
+      // This might be a RDM or customer DMX command -> not implemented so wait for next BREAK !
+      _dmxRecvState = DONE;
+    } // if
+
+  } else if (DmxState == DATA) {
+    // check for new data
+    if (*_dmxDataPtr != DmxByte) {
+      _dmxUpdated = true;
+      // store received data into dmx data buffer.
+      *_dmxDataPtr = DmxByte;
+    } // if
+    _dmxDataPtr++;
+
+    if (_dmxDataPtr > _dmxDataLastPtr) {
+      // all channels received.
+      _dmxRecvState = DONE;
+    } // if
+  } // if
+
+  if (_dmxRecvState == DONE) {
+    // continue on DMXReceiver mode.
+    _dmxRecvState = IDLE; // wait for next break
   }
   
   digitalWrite(RX_STATUS_LED_PIN, LOW);
@@ -149,43 +168,25 @@ ISR(USART_RX_vect) {
 
 void configure_serial() {
   // Set Baudrate
-  uint16_t baud_setting = (F_CPU / 4 / DMX_BAUDRATE - 1) / 2;
-  UCSR0A = 1 << U2X0;
-  
+  uint16_t baud_setting = (((F_CPU / 8) / DMX_BAUDRATE) - 1) / 2;
+
+  UCSR0A = 0;
   UBRR0H = baud_setting >> 8;
   UBRR0L = baud_setting;
- 
-  UCSR0B = 0x0;
-  UCSR0C = SERIAL_8N2;
+
+  UCSR0B = 0;
+  UCSR0C = ((1 << USBS0) | (2 << UPM00) | (3 << UCSZ00));
 
   bitSet(UCSR0B, RXEN0);
-  bitSet(UCSR0B, TXEN0);
+  bitSet(UCSR0B, RXCIE0);
+
+  bitClear(UCSR0B, TXEN0);
   bitClear(UCSR0B, TXCIE0);
-  bitClear(UCSR0B, RXCIE0);
   bitClear(UCSR0B, UDRIE0);
+
+  // Clear out any pending data
+  uint8_t  voiddata;
+  while (UCSR0A & (1 << RXC0)) {
+    voiddata = UDR0; // get data
+  }
 }
-
-void configure_timer_2() {
-  bitClear(TCCR2A, COM2A1);
-  bitClear(TCCR2A, COM2A0); //disable compare match output A mode
-  bitClear(TCCR2A, COM2B1);
-  bitClear(TCCR2A, COM2B0); //disable compare match output B mode
-  bitSet(TCCR2A, WGM21);
-  bitClear(TCCR2A, WGM20);  //set mode 2, CTC.  TOP will be set by OCRA.
-
-  bitClear(TCCR2B, FOC2A);
-  bitClear(TCCR2B, FOC2B);  //disable Force Output Compare A and B.
-  bitClear(TCCR2B, WGM22);  //set mode 2, CTC.  TOP will be set by OCRA.
-  bitClear(TCCR2B, CS22);
-  bitClear(TCCR2B, CS21);
-  bitSet(TCCR2B, CS20);   // no prescaler means the clock will increment every 62.5ns (assuming 16Mhz clock speed).
-
-  OCR2A = 64;
-  /* Set output compare register to 64, so that the Output Compare Interrupt will fire
-     every 4uS.  */
-
-  bitClear(TIMSK2, OCIE2B);  //Disable Timer/Counter2 Output Compare Match B Interrupt
-  bitSet(TIMSK2, OCIE2A);    //Enable Timer/Counter2 Output Compare Match A Interrupt
-  bitClear(TIMSK2, TOIE2);   //Disable Timer/Counter2 Overflow Interrupt Enable
-}
-
