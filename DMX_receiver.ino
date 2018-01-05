@@ -36,12 +36,8 @@ typedef enum {
 
 LiquidCrystal lcd(LCD_RS, LCD_EN, LCD_D4, LCD_D5, LCD_D6, LCD_D7);
 
-#define NUMBER_OF_CHANNELS 100
-
 uint8_t _dmxRecvState;  // Current State of receiving DMX Bytes
-int     _dmxChannel;  // the next channel byte to be sent.
 
-volatile unsigned int  _dmxMaxChannel = 32; // the last channel used for sending (1..32).
 volatile unsigned long _dmxLastPacket = 0; // the last time (using the millis function) a packet was received.
 
 bool _dmxUpdated = true; // is set to true when new data arrived.
@@ -55,6 +51,8 @@ uint8_t *_dmxDataPtr;
 
 // This pointer will point to the last byte in _dmxData;
 uint8_t *_dmxDataLastPtr;
+
+int channelOffset = 211;
 
 /******************************* Timer2 variable declarations *****************************/
 
@@ -81,6 +79,7 @@ void setup() {
   // Enable interrupts
   sei();
 
+  _dmxDataLastPtr = _dmxData + DMX_SERIAL_MAX;
 }
 
 void loop()  {
@@ -92,10 +91,10 @@ void loop()  {
 } //end loop()
 
 void action() {
-  analogWrite(PWM_LED_PIN, _dmxData[1]);
+  analogWrite(PWM_LED_PIN, _dmxData[channelOffset]);
 
   lcd.setCursor(0, 1);
-  for (int k = 1; k < 5; k++) {
+  for (int k = channelOffset; k < channelOffset + 5; k++) {
     if (_dmxData[k] < 100) {
       lcd.print("0");
     }
@@ -128,7 +127,6 @@ ISR(USART_RX_vect) {
     // break condition detected.
     _dmxRecvState = BREAK;
     _dmxDataPtr = _dmxData;
-    _dmxDataLastPtr = _dmxData + 4;
 
   } else if (DmxState == BREAK) {
     // first byte after a break was read.
