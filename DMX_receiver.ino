@@ -1,6 +1,10 @@
 /*
+ * Dmx Tester
+ * 
    See http://www.maxpierson.me/2009/03/20/receive-dmx-512-with-an-arduino/
    See https://github.com/mathertel/DMXSerial/blob/master/src/DMXSerial.cpp
+   See https://github.com/mathertel/DmxSerial2/blob/master/src/DMXSerial2.cpp
+   See http://wormfood.net/avrbaudcalc.php
 */
 
 #include <LiquidCrystal.h>
@@ -21,8 +25,8 @@
 #define LCD_D7 2
 
 // DMX
-#define DMX_BAUDRATE 250000
-#define DMX_SERIAL_MAX 512
+#define DMX_CHANNEL_OFFSET 1  // Start at channel 1
+#define DMX_SERIAL_MAX 512    // Read 512 values
 
 // State of receiving DMX Bytes
 typedef enum {
@@ -41,6 +45,7 @@ uint8_t _dmxRecvState;  // Current State of receiving DMX Bytes
 volatile unsigned long _dmxLastPacket = 0; // the last time (using the millis function) a packet was received.
 
 bool _dmxUpdated = true; // is set to true when new data arrived.
+bool _dmxNoSignal = false;
 
 // Array of DMX values (raw).
 // Entry 0 will never be used for DMX data but will store the startbyte (0 for DMX mode).
@@ -52,11 +57,8 @@ uint8_t *_dmxDataPtr;
 // This pointer will point to the last byte in _dmxData;
 uint8_t *_dmxDataLastPtr;
 
-int channelOffset = 211;
-
-/******************************* Timer2 variable declarations *****************************/
-
-volatile byte zerocounter = 0;
+// Current channel offset
+int channelOffset = DMX_CHANNEL_OFFSET;
 
 void setup() {
   pinMode(RX_TX_MODE_PIN, OUTPUT);
@@ -68,9 +70,16 @@ void setup() {
   digitalWrite(RX_TX_MODE_PIN, LOW); // Receive
 
   lcd.begin(16, 2);
-
-  lcd.print("DMX Tester");
-
+  
+  lcd.print("DMX Tester  C");
+  if (channelOffset < 100) {
+      lcd.print("0");
+    }
+    if (channelOffset < 10) {
+      lcd.print("0");
+    }
+    lcd.print(channelOffset);
+    
   // Disable interrupts
   cli();
 
@@ -86,7 +95,13 @@ void loop()  {
   // the processor gets parked here while the ISRs are doing their thing.
 
   if (_dmxUpdated) {    //when a new set of values are received, jump to action loop...
+    _dmxNoSignal = false;
+    _dmxUpdated = false;
     action();
+  } else if(_dmxLastPacket < (millis() - 100) && !_dmxNoSignal) {
+    lcd.setCursor(0, 1);
+    lcd.print("No Signal       ");
+    _dmxNoSignal = true;
   }
 } //end loop()
 
@@ -110,9 +125,6 @@ ISR(USART_RX_vect) {
   /* The receive buffer (UDR0) must be read during the reception ISR, or the ISR will just
      execute again immediately upon exiting.
   */
-
-  digitalWrite(RX_STATUS_LED_PIN, HIGH);
-
   uint8_t  USARTstate = UCSR0A;    // get state before data!
   uint8_t  DmxByte    = UDR0;     // get data
   uint8_t  DmxState   = _dmxRecvState;  //just load once from SRAM to increase speed
@@ -132,6 +144,8 @@ ISR(USART_RX_vect) {
     // first byte after a break was read.
     if (DmxByte == 0) {
       // normal DMX start code (0) detected
+      digitalWrite(RX_STATUS_LED_PIN, HIGH);
+      
       _dmxRecvState = DATA;
       _dmxLastPacket = millis(); // remember current (relative) time in msecs.
       _dmxDataPtr++; // start saving data with channel # 1
@@ -158,29 +172,33 @@ ISR(USART_RX_vect) {
 
   if (_dmxRecvState == DONE) {
     // continue on DMXReceiver mode.
+    digitalWrite(RX_STATUS_LED_PIN, LOW);
+    
     _dmxRecvState = IDLE; // wait for next break
   }
-  
-  digitalWrite(RX_STATUS_LED_PIN, LOW);
 }
 
 void configure_serial() {
   // Set Baudrate
-  uint16_t baud_setting = (((F_CPU / 8) / DMX_BAUDRATE) - 1) / 2;
-
-  UCSR0A = 0;
+  uint16_t baud_setting = 0x03; // DMX 250000 baud
   UBRR0H = baud_setting >> 8;
   UBRR0L = baud_setting;
 
+  // Clear out current config / status
+  UCSR0A = 0;
   UCSR0B = 0;
-  UCSR0C = ((1 << USBS0) | (2 << UPM00) | (3 << UCSZ00));
+  UCSR0C = 0;
 
-  bitSet(UCSR0B, RXEN0);
-  bitSet(UCSR0B, RXCIE0);
+  bitSet(UCSR0B, RXEN0);    // Enable receiver
+  bitSet(UCSR0B, RXCIE0);   // Enable receive complete interrupt
 
-  bitClear(UCSR0B, TXEN0);
-  bitClear(UCSR0B, TXCIE0);
-  bitClear(UCSR0B, UDRIE0);
+  bitClear(UCSR0B, TXEN0);  // Disable transmitter
+  bitClear(UCSR0B, TXCIE0); // Disable transmit complete interrupt
+  bitClear(UCSR0B, UDRIE0); // Disable data register empty interrupt
+
+  bitSet(UCSR0C, USBS0);    // 2 stop bits
+  bitSet(UCSR0C, UCSZ01);   // 8 bit characters 
+  bitSet(UCSR0C, UCSZ00);   // combined with above
 
   // Clear out any pending data
   uint8_t  voiddata;
