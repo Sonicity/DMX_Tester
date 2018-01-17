@@ -12,6 +12,7 @@
 // Miscelaeous pins
 #define RX_STATUS_LED_PIN 8
 #define PWM_LED_PIN 9
+#define MAIN_LOOP_LED 13
 
 // Pins connected to the SN75176AP
 #define RX_TX_MODE_PIN 7  // Toggles Driver Enable / Receiver Enable
@@ -64,10 +65,12 @@ void setup() {
   pinMode(RX_TX_MODE_PIN, OUTPUT);
   pinMode(RX_STATUS_LED_PIN, OUTPUT); //RX STATUS LED pin, blinks on incoming DMX data
   pinMode(PWM_LED_PIN, OUTPUT);
+  pinMode(MAIN_LOOP_LED, OUTPUT);
 
   digitalWrite(RX_STATUS_LED_PIN, LOW);
   analogWrite(PWM_LED_PIN, 0);
   digitalWrite(RX_TX_MODE_PIN, LOW); // Receive
+  digitalWrite(MAIN_LOOP_LED, LOW);
 
   lcd.begin(16, 2);
   
@@ -92,12 +95,18 @@ void setup() {
 }
 
 void loop()  {
-  // the processor gets parked here while the ISRs are doing their thing.
-
+  /* Based on DMX speed we have roughly 22ms to complete the tasks in 
+   * the _dmxupdated loop. That is the time it takes the entire DMX sequence
+   * to be sent. Of course we need to substract the time take by the ISR, but 
+   * it gives a rough indication about the amount of work we can do here without
+   * worrying about missed frames.
+   */
   if (_dmxUpdated) {    //when a new set of values are received, jump to action loop...
+    digitalWrite(MAIN_LOOP_LED, HIGH);    
     _dmxNoSignal = false;
     _dmxUpdated = false;
     action();
+    digitalWrite(MAIN_LOOP_LED, LOW);  
   } else if(_dmxLastPacket < (millis() - 100) && !_dmxNoSignal) {
     lcd.setCursor(0, 1);
     lcd.print("No Signal       ");
@@ -106,24 +115,28 @@ void loop()  {
 } //end loop()
 
 void action() {
+  /* Currently timed at rougly 4.7ms 
+  */
   analogWrite(PWM_LED_PIN, _dmxData[channelOffset]);
 
   lcd.setCursor(0, 1);
-  for (int k = channelOffset; k < channelOffset + 5; k++) {
-    if (_dmxData[k] < 100) {
-      lcd.print("0");
+  for (int k = channelOffset; k < channelOffset + 4; k++) {
+    lcd.print((char)((unsigned)_dmxData[k] / 100      + '0'));
+    lcd.print((char)((unsigned)_dmxData[k] / 10  % 10 + '0'));
+    lcd.print((char)((unsigned)_dmxData[k]       % 10 + '0'));
+    if (k < channelOffset + 3) {
+      lcd.print(' ');
     }
-    if (_dmxData[k] < 10) {
-      lcd.print("0");
-    }
-    lcd.print(_dmxData[k]);
-    lcd.print(" ");
   }
 }
 
 ISR(USART_RX_vect) {
   /* The receive buffer (UDR0) must be read during the reception ISR, or the ISR will just
      execute again immediately upon exiting.
+
+     This ISR triggers on every byte received, given the baud rate of DMX this
+     method should complete within 44us to make sure the next byte can be received
+     in time.
   */
   uint8_t  USARTstate = UCSR0A;    // get state before data!
   uint8_t  DmxByte    = UDR0;     // get data
@@ -135,8 +148,10 @@ ISR(USART_RX_vect) {
     return;
   }
 
-  if (USARTstate & (1 << FE0)) {  //check for break
-    // break condition detected.
+  if (USARTstate & (1 << FE0)) { 
+    /* Check for frame error indicating a break
+     * This indicates a start of the sequence in DMX 
+     */
     _dmxRecvState = BREAK;
     _dmxDataPtr = _dmxData;
 
@@ -158,7 +173,7 @@ ISR(USART_RX_vect) {
   } else if (DmxState == DATA) {
     // check for new data
     if (*_dmxDataPtr != DmxByte) {
-      _dmxUpdated = true;
+      
       // store received data into dmx data buffer.
       *_dmxDataPtr = DmxByte;
     } // if
@@ -167,6 +182,7 @@ ISR(USART_RX_vect) {
     if (_dmxDataPtr > _dmxDataLastPtr) {
       // all channels received.
       _dmxRecvState = DONE;
+      _dmxUpdated = true;
     } // if
   } // if
 
