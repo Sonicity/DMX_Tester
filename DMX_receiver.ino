@@ -9,21 +9,24 @@
 
 #include <LiquidCrystal.h>
 
-// Miscelaeous pins
-#define RX_STATUS_LED_PIN 8
-#define PWM_LED_PIN 9
-#define MAIN_LOOP_LED 13
-
-// Pins connected to the SN75176AP
-#define RX_TX_MODE_PIN 7  // Toggles Driver Enable / Receiver Enable
+// Led pins
+#define RX_STATUS_LED_PIN 13
+#define PWM_LED_PIN_1 6
+#define PWM_LED_PIN_2 9
+#define PWM_LED_PIN_3 10
+#define PWM_LED_PIN_4 11
 
 // Pins connected to the LCD
-#define LCD_RS 12
-#define LCD_EN 11
+#define LCD_RS 1
+#define LCD_EN 4
 #define LCD_D4 5
-#define LCD_D5 4
-#define LCD_D6 3
-#define LCD_D7 2
+#define LCD_D5 7
+#define LCD_D6 8
+#define LCD_D7 12
+
+// Push buttons for channel up/down
+#define PIN_SWITCH_UP 2   // HW INT #0
+#define PIN_SWITCH_DOWN 3 // HW INT #1
 
 // DMX
 #define DMX_CHANNEL_OFFSET 1  // Start at channel 1
@@ -59,34 +62,38 @@ uint8_t *_dmxDataPtr;
 uint8_t *_dmxDataLastPtr;
 
 // Current channel offset
-int channelOffset = DMX_CHANNEL_OFFSET;
+volatile int channelOffset = DMX_CHANNEL_OFFSET;
+
+// Flag set by the interrupt handler if the channelOffset changed
+volatile bool channelChanged = false;
 
 void setup() {
-  pinMode(RX_TX_MODE_PIN, OUTPUT);
-  pinMode(RX_STATUS_LED_PIN, OUTPUT); //RX STATUS LED pin, blinks on incoming DMX data
-  pinMode(PWM_LED_PIN, OUTPUT);
-  pinMode(MAIN_LOOP_LED, OUTPUT);
+  pinMode(RX_STATUS_LED_PIN, OUTPUT);
+  pinMode(PWM_LED_PIN_1, OUTPUT);
+  pinMode(PWM_LED_PIN_2, OUTPUT);
+  pinMode(PWM_LED_PIN_3, OUTPUT);
+  pinMode(PWM_LED_PIN_4, OUTPUT);
 
   digitalWrite(RX_STATUS_LED_PIN, LOW);
-  analogWrite(PWM_LED_PIN, 0);
-  digitalWrite(RX_TX_MODE_PIN, LOW); // Receive
-  digitalWrite(MAIN_LOOP_LED, LOW);
+  analogWrite(PWM_LED_PIN_1, 0);
+  analogWrite(PWM_LED_PIN_2, 0);
+  analogWrite(PWM_LED_PIN_3, 0);
+  analogWrite(PWM_LED_PIN_4, 0);
 
   lcd.begin(16, 2);
   
   lcd.print("DMX Tester  C");
-  if (channelOffset < 100) {
-      lcd.print("0");
-    }
-    if (channelOffset < 10) {
-      lcd.print("0");
-    }
-    lcd.print(channelOffset);
-    
+  updateChannel();    
+  
   // Disable interrupts
   cli();
 
   configure_serial();
+
+  // Attach button handlers to hardware interrupts.
+  // The debounce circuit is open high, so trigger on the rising edge
+  attachInterrupt(digitalPinToInterrupt(PIN_SWITCH_DOWN), channel_down, RISING);
+  attachInterrupt(digitalPinToInterrupt(PIN_SWITCH_UP), channel_up, RISING);
 
   // Enable interrupts
   sei();
@@ -101,23 +108,33 @@ void loop()  {
    * it gives a rough indication about the amount of work we can do here without
    * worrying about missed frames.
    */
+   if (channelChanged) {
+    updateChannel();
+    channelChanged = false;
+   }
+   
   if (_dmxUpdated) {    //when a new set of values are received, jump to action loop...
-    digitalWrite(MAIN_LOOP_LED, HIGH);    
     _dmxNoSignal = false;
     _dmxUpdated = false;
     action();
-    digitalWrite(MAIN_LOOP_LED, LOW);  
   } else if(_dmxLastPacket < (millis() - 100) && !_dmxNoSignal) {
     lcd.setCursor(0, 1);
     lcd.print("No Signal       ");
     _dmxNoSignal = true;
   }
+  
 } //end loop()
 
+/* Code to be executed once a new stream of DMX data has been 
+ * received. Triggered from the main loop
+ */
 void action() {
   /* Currently timed at rougly 4.7ms 
   */
-  analogWrite(PWM_LED_PIN, _dmxData[channelOffset]);
+  analogWrite(PWM_LED_PIN_1, _dmxData[channelOffset]);
+  analogWrite(PWM_LED_PIN_2, _dmxData[channelOffset + 1]);
+  analogWrite(PWM_LED_PIN_3, _dmxData[channelOffset + 2]);
+  analogWrite(PWM_LED_PIN_4, _dmxData[channelOffset + 3]);
 
   lcd.setCursor(0, 1);
   for (int k = channelOffset; k < channelOffset + 4; k++) {
@@ -128,6 +145,15 @@ void action() {
       lcd.print(' ');
     }
   }
+}
+
+/* Updates the channel number on the LCD
+ */
+void updateChannel() {
+  lcd.setCursor(13, 0);
+  lcd.print((char)((unsigned)channelOffset / 100      + '0'));
+  lcd.print((char)((unsigned)channelOffset / 10  % 10 + '0'));
+  lcd.print((char)((unsigned)channelOffset       % 10 + '0'));
 }
 
 ISR(USART_RX_vect) {
@@ -194,6 +220,32 @@ ISR(USART_RX_vect) {
   }
 }
 
+/*  Triggered by hardware interrupt
+ *  increased the channel the receiver listens
+ *  to by one.
+ */
+void channel_up() {
+  if (channelOffset < 508) {
+    channelOffset ++;
+    channelChanged = true;
+  }
+}
+
+/*  Triggered by hardware interrupt
+ *  lowers the current channel the receiver is 
+ *  listening to by one
+ */
+void channel_down() {
+  if (channelOffset > 1) {
+    channelOffset --;
+    channelChanged = true;
+  }
+}
+
+/* Configure the uart for DMX
+ * 2500000 Baud 8N2
+ * data receive interrupts only
+ */
 void configure_serial() {
   // Set Baudrate
   uint16_t baud_setting = 0x03; // DMX 250000 baud
